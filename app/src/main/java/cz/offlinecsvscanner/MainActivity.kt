@@ -8,6 +8,8 @@ import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.*
+import androidx.camera.core.ImageCapture
+import androidx.camera.core.ImageCaptureException
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.layout.*
@@ -122,7 +124,7 @@ private fun ScannerApp() {
                 else if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) camera = true
                 else permission.launch(Manifest.permission.CAMERA)
             }, enabled = csv != null, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.CameraAlt, null); Text(" Spustit skener") }
-            if (camera) CameraScanner(onCode = { match(it) }, onClose = { camera = false })
+            if (camera) CameraScanner(onSearch = { match(it) }, onClose = { camera = false })
             OutlinedButton(onClick = { manualCode = detected; manual = true }, enabled = csv != null, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.Edit, null); Text(" Ruční zadání / oprava") }
             if (detected.isNotBlank()) Text("Poslední OCR: $detected")
             Text(message)
@@ -152,49 +154,123 @@ private fun Metric(label: String, value: Int) {
 }
 
 @Composable
-private fun CameraScanner(onCode: (String) -> Unit, onClose: () -> Unit) {
+private fun CameraScanner(onSearch: (String) -> Unit, onClose: () -> Unit) {
     val context = LocalContext.current
     val owner = LocalLifecycleOwner.current
     val executor = remember { Executors.newSingleThreadExecutor() }
     val recognizer = remember { TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS) }
+    var imageCapture by remember { mutableStateOf<ImageCapture?>(null) }
     var processing by remember { mutableStateOf(false) }
-    var lastCode by remember { mutableStateOf("") }
-    DisposableEffect(Unit) { onDispose { recognizer.close(); executor.shutdown() } }
+    var recognizedText by remember { mutableStateOf("") }
+    var scanMessage by remember { mutableStateOf("Zaměřte označení dílu a stiskněte SPUSTIT SKENOVÁNÍ.") }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            recognizer.close()
+            executor.shutdown()
+        }
+    }
+
+    fun captureAndRead() {
+        val capture = imageCapture
+        if (capture == null) {
+            scanMessage = "Kamera se ještě připravuje. Zkuste to za chvíli."
+            return
+        }
+        if (processing) return
+        processing = true
+        scanMessage = "Pořizuji snímek a rozpoznávám text…"
+        capture.takePicture(executor, object : ImageCapture.OnImageCapturedCallback() {
+            override fun onCaptureSuccess(image: ImageProxy) {
+                val mediaImage = image.image
+                if (mediaImage == null) {
+                    image.close()
+                    processing = false
+                    scanMessage = "Nepodařilo se načíst snímek. Zkuste skenování znovu."
+                    return
+                }
+                val input = InputImage.fromMediaImage(mediaImage, image.imageInfo.rotationDegrees)
+                recognizer.process(input)
+                    .addOnSuccessListener { result ->
+                        val code = extractCode(result.text)
+                        recognizedText = if (code.isNotBlank()) code else result.text.trim().replace(Regex("\\s+"), " ")
+                        scanMessage = if (code.isNotBlank()) "Text rozpoznán. Zkontrolujte jej a stiskněte HLEDAT." else "Kód se nepodařilo jednoznačně rozpoznat. Upravte text ručně a stiskněte HLEDAT."
+                    }
+                    .addOnFailureListener { error ->
+                        scanMessage = "Chyba OCR: ${error.localizedMessage ?: "neznámá chyba"}"
+                    }
+                    .addOnCompleteListener {
+                        image.close()
+                        processing = false
+                    }
+            }
+
+            override fun onError(exception: ImageCaptureException) {
+                processing = false
+                scanMessage = "Chyba fotoaparátu: ${exception.message ?: "snímek se nepodařilo pořídit"}"
+            }
+        })
+    }
 
     Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             AndroidView(factory = { ctx ->
-                val view = PreviewView(ctx)
+                val view = PreviewView(ctx).apply {
+                    scaleType = PreviewView.ScaleType.FILL_CENTER
+                }
                 val future = ProcessCameraProvider.getInstance(ctx)
                 future.addListener({
                     val provider = future.get()
                     val preview = Preview.Builder().build().also { it.setSurfaceProvider(view.surfaceProvider) }
-                    val analysis = ImageAnalysis.Builder().setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build()
-                    analysis.setAnalyzer(executor) { proxy ->
-                        if (!processing) {
-                            processing = true
-                            val media = proxy.image
-                            if (media == null) { proxy.close(); processing = false }
-                            else recognizer.process(InputImage.fromMediaImage(media, proxy.imageInfo.rotationDegrees))
-                                .addOnSuccessListener { result ->
-                                    val code = extractCode(result.text)
-                                    if (code.isNotBlank() && code != lastCode) { lastCode = code; onCode(code) }
-                                }.addOnCompleteListener { proxy.close(); processing = false }
-                        } else proxy.close()
+                    val stillCapture = ImageCapture.Builder()
+                        .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+                        .setJpegQuality(100)
+                        .build()
+                    try {
+                        provider.unbindAll()
+                        provider.bindToLifecycle(owner, CameraSelector.DEFAULT_BACK_CAMERA, preview, stillCapture)
+                        imageCapture = stillCapture
+                    } catch (e: Exception) {
+                        scanMessage = "Kameru se nepodařilo spustit: ${e.localizedMessage}"
                     }
-                    try { provider.unbindAll(); provider.bindToLifecycle(owner, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis) } catch (_: Exception) { }
                 }, ContextCompat.getMainExecutor(ctx))
                 view
-            }, modifier = Modifier.fillMaxWidth().height(290.dp))
-            Text("OCR probíhá offline přímo v zařízení.")
+            }, modifier = Modifier.fillMaxWidth().height(300.dp))
+
+            Text("Kamera běží. OCR je vypnuté, dokud nestisknete tlačítko.", style = MaterialTheme.typography.bodySmall)
+            Button(
+                onClick = { captureAndRead() },
+                enabled = !processing && imageCapture != null,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Icon(Icons.Default.CameraAlt, null)
+                Text(if (processing) " ZPRACOVÁVÁM SNÍMEK…" else " SPUSTIT SKENOVÁNÍ")
+            }
+            OutlinedTextField(
+                value = recognizedText,
+                onValueChange = { recognizedText = it },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Rozpoznaný text – lze ručně opravit") },
+                placeholder = { Text("Např. 473-5845 P20") },
+                singleLine = true
+            )
+            Button(
+                onClick = { onSearch(recognizedText.trim()) },
+                enabled = recognizedText.isNotBlank() && !processing,
+                modifier = Modifier.fillMaxWidth()
+            ) { Icon(Icons.Default.Search, null); Text(" HLEDAT") }
+            Text(scanMessage, style = MaterialTheme.typography.bodySmall)
             TextButton(onClick = onClose, modifier = Modifier.align(Alignment.End)) { Text("Zavřít kameru") }
         }
     }
 }
 
 private fun extractCode(text: String): String {
-    val regex = Regex("\\b\\d{3}\\s*-\\s*\\d{4}\\s+P\\s*\\d+\\b", RegexOption.IGNORE_CASE)
-    return regex.find(text.replace('\n', ' '))?.value?.replace(Regex("\\s+"), " ")?.replace(Regex("\\s*P\\s*", RegexOption.IGNORE_CASE), " P") ?: ""
+    // Supports the usual marking 473-5845 P20 and OCR variants with missing spaces/dash.
+    val compact = text.replace('\n', ' ').replace('–', '-').replace('—', '-')
+    val regex = Regex("(?<!\\d)(\\d{3})\\s*-?\\s*(\\d{4})\\s*P\\s*(\\d+)(?!\\d)", RegexOption.IGNORE_CASE)
+    val match = regex.find(compact) ?: return ""
+    return "${match.groupValues[1]}-${match.groupValues[2]} P${match.groupValues[3]}"
 }
 private fun normalize(value: String) = value.uppercase().replace(Regex("\\s+"), "").replace("–", "-").replace("—", "-")
 

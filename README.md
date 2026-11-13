@@ -26,3 +26,12 @@ The ML Kit Text Recognition dependency uses the bundled Latin model, so OCR runs
 4. Unzip the artifact and install `app-debug.apk` on your Android phone. You may need to allow installation from your browser or file manager.
 
 The workflow builds a debug APK. It is suitable for testing and direct installation; it is not a Play Store release-signed APK.
+
+
+## Režim skenování – jeden snímek na požádání
+- Kamera zobrazuje živý náhled, ale OCR neběží průběžně.
+- Tlačítko **SPUSTIT SKENOVÁNÍ** pořídí jeden snímek v maximální kvalitě a předá jej offline OCR v ML Kit.
+- Rozpoznaný text se zobrazí v editovatelném poli.
+- Tlačítko **HLEDAT** teprve potom vyhledá kód v CSV a při shodě nastaví `Stav` na `OK`.
+- Pokud OCR kód nepřečte přesně, lze text opravit ručně; při nenalezení se otevře dialog pro opravu.
+- Rozpoznávání normalizuje běžný zápis `473-5845 P20` a toleruje vynechanou pomlčku nebo mezery.
